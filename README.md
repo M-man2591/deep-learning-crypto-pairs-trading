@@ -19,17 +19,17 @@ This means the full pipeline is reproducible without Bloomberg, Refinitiv, or ot
 
 | Metric | DNN | LSTM | Dynamic Ensemble |
 |:---|:---:|:---:|:---:|
-| MSE | 0.967 | **0.717** | 0.751 |
-| RMSE | 0.983 | **0.847** | 0.867 |
-| MAE | 0.628 | **0.328** | 0.393 |
-| Theil U | 1.027 | **0.885** | 0.906 |
+| MSE | 0.313 | **0.047** | 0.063 |
+| RMSE | 0.560 | **0.216** | 0.252 |
+| MAE | 0.478 | **0.110** | 0.149 |
+| Theil U | 2.627 | **1.014** | 1.183 |
 
 | Risk / Signal Metric | Value |
 |:---|:---:|
 | Johansen Trace Stat (r ≤ 0) | **292.6** (significant at 99%) |
-| ADF p-value (spread stationarity) | **0.026** |
-| Hit Rate (win %) | **76.2 %** |
-| Sharpe Ratio (annualised) | **1.32** |
+| ADF p-value (spread stationarity) | **0.041** |
+| Hit Rate (active position-days) | **71.0 %** |
+| Sharpe Ratio (annualised, net of TC) | **2.94** |
 | 99 % Coverage Probability | **99.0 %** |
 | Data Range | 2018-01-02 → 2026-02-01 (2,952 obs) |
 
@@ -110,8 +110,8 @@ BUY when the predicted dynamic score falls below its 10th percentile (undervalue
 
 ```bash
 # Clone the repository
-git clone https://github.com/<your-username>/crypto-pairs-trading.git
-cd crypto-pairs-trading
+git clone https://github.com/M-man2591/deep-learning-crypto-pairs-trading.git
+cd deep-learning-crypto-pairs-trading
 
 # Create and activate environment
 conda create -n quant python=3.11 -y
@@ -174,12 +174,13 @@ After a professional quant reviewed the initial implementation, three issues wer
 |:---|:---|:---|
 | **Look-ahead bias in trading signals** | Percentile thresholds were computed over the *entire* test set at once — future predictions leaked into today's threshold | Replaced with **expanding-window percentiles**: at time *t*, thresholds use only `score[0..t-1]` |
 | **Exit strategy too frequent** | Positions flipped between BUY/SELL/HOLD every day with no concept of "holding a trade" | Added a **finite-state machine**: enter on threshold breach, hold until mean-reversion (score crosses 0), then exit. Creates proper trade cycles |
-| **Transaction costs from hedge-ratio turnover** | The Johansen vector changes every day → daily portfolio rebalancing | Applied **EWM smoothing** (span=20) to the co-integrating vectors, reducing turnover by ~40%. Added an explicit **transaction cost model** to risk metrics |
+| **Transaction costs from hedge-ratio turnover** | The Johansen vector changes every day → daily portfolio rebalancing | Applied **EWM smoothing** (span=20) to the co-integrating vectors, reducing turnover by ~72%. Added an explicit **transaction cost model** to risk metrics |
 
 ### Remaining Known Limitations
 
 - **No slippage model** — the strategy assumes execution at the close price with no market impact.
 - **Z-score space P/L** — risk metrics are computed in z-score units, not in dollar terms. Mapping to actual portfolio returns requires position sizing and leverage decisions.
+- **Prediction interval calibration is ex-post** — interval width uses realised test-set error quantiles for evaluation quality, not online real-time calibration.
 - **Single co-integrating vector** — only the dominant eigenvector is used. The Johansen test may find multiple co-integrating relationships that could be exploited simultaneously.
 - **No regime detection** — the strategy trades uniformly. A Hidden Markov Model or similar could identify when the co-integrating relationship is strong enough to trade vs when to stand aside.
 

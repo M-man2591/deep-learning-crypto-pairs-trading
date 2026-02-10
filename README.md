@@ -7,6 +7,14 @@ A minimum viable recreation of the paper **"Deep learning-based pairs trading: r
 
 ---
 
+## Data Source Declaration
+
+Data sourced from Yahoo Finance via `yfinance` API. No proprietary data used.
+
+This means the full pipeline is reproducible without Bloomberg, Refinitiv, or other paid terminals.
+
+---
+
 ## Highlights
 
 | Metric | DNN | LSTM | Dynamic Ensemble |
@@ -193,6 +201,16 @@ After a professional quant reviewed the initial implementation, three issues wer
 2. Gatev E, Goetzmann WN, Rouwenhorst KG (2006). "Pairs trading: performance of a relative-value arbitrage rule." *Review of Financial Studies*, 19(3):797–827.
 3. Lo AW (2004). "The adaptive markets hypothesis." *Journal of Portfolio Management*, 30(5):15–29.
 4. Franses PH (2021). "Time-varying lag co-integration." *Journal of Computational and Applied Mathematics*, 390:113272.
+
+---
+
+## Disclaimer
+
+This project is for educational and research purposes.
+
+While the strategy addresses look-ahead bias and transaction costs, the hyperparameters (e.g., lookback windows) were selected using historical data from 2018-2026.
+
+Past performance is not indicative of future results in a live trading environment.
 
 ---
 

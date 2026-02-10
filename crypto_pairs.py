@@ -89,6 +89,17 @@ DWE_WINDOW = 50
 UPPER_PCT = 90
 LOWER_PCT = 10
 
+# ── Improvements over base paper (addressing professional review) ──
+# Transaction cost per unit of position change (in z-score space).
+# Even a small cost erodes profits when turnover is high.
+TC_COST = 0.01
+
+# Minimum observations before computing expanding-window percentile thresholds
+MIN_OBS_PCT = 50
+
+# EWM span for smoothing daily Johansen vectors → reduces hedge-ratio turnover
+SMOOTH_SPAN = 20
+
 SEED = 42
 CSV_FILE = "crypto_data.csv"
 
@@ -545,25 +556,77 @@ def error_metrics(
 # 9  Trading signals  (Section 3.2, Figure 6)
 # ══════════════════════════════════════════════════════════════
 def trading_signals(
-    score: np.ndarray, upper_pct: float, lower_pct: float
-) -> tuple[np.ndarray, float, float]:
-    """Generate BUY / SELL / HOLD signals from the predicted dynamic score.
+    score: np.ndarray,
+    upper_pct: float,
+    lower_pct: float,
+    min_obs: int = 50,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Position-aware trading signals with expanding-window thresholds.
 
-    **Mean-reversion logic:**
-    - When the predicted score is *extremely high* (above the 90th
-      percentile), the spread is "over-valued" relative to recent history
-      and is statistically likely to fall back → **SELL**.
-    - When the predicted score is *extremely low* (below the 10th
-      percentile), the spread is "under-valued" and likely to rise → **BUY**.
-    - Otherwise → **HOLD**.
+    **Fixes over naïve approach (professional review):**
 
-    Using *percentiles* rather than fixed numbers makes the thresholds
-    adaptive to the actual distribution of predicted scores.
+    1. **No look-ahead bias.**  The original implementation computed
+       percentile thresholds over the *entire* test set at once — meaning
+       the threshold at day 1 already used information from day 393.
+       Now, thresholds at time *t* are computed from ``score[0 : t]``
+       only (expanding window), so no future data is ever used.
+
+    2. **Proper exit strategy.**  The original code flipped between
+       BUY / SELL / HOLD every day, causing excessive turnover.  Now a
+       finite-state machine manages positions:
+       - **Enter LONG** when the score drops below the lower threshold
+         (undervalued → expect mean-reversion upward).
+       - **Exit LONG** when the score reverts above 0 (mean).
+       - **Enter SHORT** when the score rises above the upper threshold
+         (overvalued → expect mean-reversion downward).
+       - **Exit SHORT** when the score reverts below 0.
+
+       This creates complete trade cycles (entry → hold → exit) and
+       prevents the constant position-flipping that erodes profits.
+
+    Returns
+    -------
+    sig    : int array of positions at each step (+1 long, −1 short, 0 flat)
+    up_arr : float array of expanding upper thresholds (NaN where < min_obs)
+    lo_arr : float array of expanding lower thresholds (NaN where < min_obs)
     """
-    up = float(np.percentile(score, upper_pct))
-    lo = float(np.percentile(score, lower_pct))
-    sig = np.where(score > up, -1, np.where(score < lo, 1, 0))
-    return sig, up, lo
+    n = len(score)
+    sig = np.zeros(n, dtype=int)
+    up_arr = np.full(n, np.nan)
+    lo_arr = np.full(n, np.nan)
+    position = 0  # current state: +1 long, −1 short, 0 flat
+
+    for t in range(n):
+        if t < min_obs:
+            # Not enough history for reliable percentile estimates
+            sig[t] = position
+            continue
+
+        # Expanding-window thresholds — strictly causal (uses [0..t-1])
+        up = np.percentile(score[:t], upper_pct)
+        lo = np.percentile(score[:t], lower_pct)
+        up_arr[t] = up
+        lo_arr[t] = lo
+
+        # ── State machine ──
+        if position == 0:
+            # Flat → look for entry
+            if score[t] < lo:
+                position = 1    # enter long
+            elif score[t] > up:
+                position = -1   # enter short
+        elif position == 1:
+            # Long → exit when score reverts above mean (0)
+            if score[t] >= 0:
+                position = 0
+        elif position == -1:
+            # Short → exit when score reverts below mean (0)
+            if score[t] <= 0:
+                position = 0
+
+        sig[t] = position
+
+    return sig, up_arr, lo_arr
 
 
 # ══════════════════════════════════════════════════════════════
@@ -572,29 +635,35 @@ def trading_signals(
 def risk_metrics(
     signals: np.ndarray,
     spread: np.ndarray,
+    tc_cost: float = 0.0,
     market_ret: Optional[np.ndarray] = None,
 ) -> dict[str, float]:
     """Compute portfolio-level risk metrics for the trading strategy.
 
-    - **Hit Rate** – fraction of trades that were profitable.
-    - **Avg P/L per Trade** – mean profit/loss on trade days only.
-    - **Max Drawdown (MDD)** – largest peak-to-trough decline in equity;
-      measures the worst-case loss an investor would have experienced.
-    - **Sharpe Ratio** – (annualised mean return) / (annualised volatility).
-      Values > 1 are generally considered good; > 2 is excellent.
-    - **Sortino Ratio** – like Sharpe but only penalises *downside*
-      volatility, so it does not punish large positive returns.
-    - **Avg Position Size** – fraction of time the strategy has an open
-      position (0 = always flat, 1 = always in market).
-    - **Signal Lag** – cross-correlation lag between signals and actual
-      spread changes; 0 is ideal (signals are not delayed).
-    - **Market Correlation** – Pearson ρ between strategy returns and a
-      market proxy (ETH).  A negative value means the strategy tends to
-      profit when the market drops → good diversifier.
+    **Transaction cost model (improvement over base paper):**
+    Every time the position changes (e.g. flat→long, long→flat), a cost
+    proportional to ``tc_cost × |Δposition|`` is deducted.  This
+    penalises high turnover and produces realistic net-of-cost metrics.
+
+    - **Hit Rate** – fraction of active position-days that were profitable.
+    - **Avg P/L per Trade** – mean daily P/L on active position-days.
+    - **Max Drawdown (MDD)** – largest peak-to-trough decline in equity.
+    - **Sharpe Ratio** – annualised (mean / σ) of daily net returns.
+    - **Sortino Ratio** – like Sharpe but only penalises downside.
+    - **Avg Position Size** – fraction of days with an open position.
+    - **Num Trades** – total number of position changes (entries + exits).
+    - **Total TC** – cumulative transaction cost deducted.
+    - **Signal Lag** – cross-correlation lag; 0 is ideal.
+    - **Market Correlation** – ρ vs ETH; negative = good diversifier.
     """
     d_sp = np.diff(spread)
     sig = signals[:-1]   # signal at t → P/L realised at t+1
-    ret = sig * d_sp
+    ret_gross = sig * d_sp
+
+    # Transaction costs: proportional to |position change|
+    pos_changes = np.abs(np.diff(np.concatenate([[0], signals])))[:-1]
+    tc_total = tc_cost * pos_changes
+    ret = ret_gross - tc_total      # net returns
 
     trades = ret[sig != 0]
     hit = float(np.mean(trades > 0)) if len(trades) else 0.0
@@ -614,6 +683,7 @@ def risk_metrics(
     sortino = float(np.sqrt(252) * mu / dsd)
 
     pos = float(np.mean(np.abs(sig)))
+    n_trades = int(pos_changes.sum())
 
     # Signal lag via cross-correlation
     if len(d_sp) > 1:
@@ -638,6 +708,8 @@ def risk_metrics(
         "Sharpe Ratio": sharpe,
         "Sortino Ratio": sortino,
         "Avg Position Size": pos,
+        "Num Trades": n_trades,
+        "Total TC": float(tc_total.sum()),
         "Signal Lag (days)": lag,
         "Market Correlation": mcorr,
     }
@@ -743,8 +815,26 @@ def main() -> None:  # noqa: C901
     # standard pre-processing in financial econometrics.
     log_p = np.log(prices[tickers_avail].clip(lower=1e-8))
     vectors, spread_raw = rolling_johansen(log_p, window=COINT_WINDOW)
+
+    # ── Smooth Johansen vectors to reduce hedge-ratio turnover ──
+    # Daily re-estimation of the co-integrating vector means the
+    # portfolio weights change every day, generating large rebalancing
+    # costs.  Exponential smoothing (EWM) stabilises the vectors while
+    # preserving the adaptive nature of rolling estimation.
+    turnover_raw = float(vectors.diff().abs().mean().sum())
+    vectors = vectors.ewm(span=SMOOTH_SPAN, min_periods=1).mean()
+    turnover_smooth = float(vectors.diff().abs().mean().sum())
+
+    # Recompute spread with smoothed vectors
+    spread_raw = (log_p * vectors).sum(axis=1)
+    spread_raw[vectors.isna().any(axis=1)] = np.nan
     spread_raw = spread_raw.dropna()
     print(f"  Raw spread length after dropna: {len(spread_raw):,}")
+    print(
+        f"  Hedge-ratio turnover:  raw = {turnover_raw:.4f}   "
+        f"smoothed = {turnover_smooth:.4f}   "
+        f"(−{(1 - turnover_smooth / max(turnover_raw, 1e-10)) * 100:.0f} %)"
+    )
 
     # Full-sample Johansen for trace-test table  (Table 2b)
     full_data = log_p.dropna()
@@ -898,61 +988,70 @@ def main() -> None:  # noqa: C901
     print("Step 8 · Trading Signals  [Figure 6 / Table 5]")
     print("=" * 65)
     dynamic_score = p_ens
-    sigs, up_th, lo_th = trading_signals(
-        dynamic_score, UPPER_PCT, LOWER_PCT
+    sigs, up_arr, lo_arr = trading_signals(
+        dynamic_score, UPPER_PCT, LOWER_PCT, MIN_OBS_PCT
     )
 
-    n_buy = int((sigs == 1).sum())
-    n_sell = int((sigs == -1).sum())
-    n_hold = int((sigs == 0).sum())
-    total_signals = n_buy + n_sell
+    # Position-day counts
+    n_long_days = int((sigs == 1).sum())
+    n_short_days = int((sigs == -1).sum())
+    n_flat_days = int((sigs == 0).sum())
 
+    # Trade counts (entries + exits)
+    pos_changes = np.abs(np.diff(np.concatenate([[0], sigs])))
+    n_trades = int(pos_changes.sum())
+    n_round_trips = n_trades // 2
+
+    # Win rate: fraction of active position-days where P/L > 0
     d_sp = np.diff(y_actual)
+    active_days = 0
     wins = 0
     for t in range(len(sigs) - 1):
-        if sigs[t] == 1 and d_sp[t] > 0:
-            wins += 1
-        elif sigs[t] == -1 and d_sp[t] < 0:
-            wins += 1
-    win_pct = wins / max(total_signals, 1) * 100
+        if sigs[t] != 0:
+            active_days += 1
+            if sigs[t] * d_sp[t] > 0:  # position direction × move > 0
+                wins += 1
+    win_pct = wins / max(active_days, 1) * 100
 
-    print(f"  BUY = {n_buy}   SELL = {n_sell}   HOLD = {n_hold}")
-    print(
-        f"  Total signals: {total_signals}   "
-        f"Winning: {wins} ({win_pct:.1f}%)"
-    )
+    print(f"  Long days = {n_long_days}   Short days = {n_short_days}   "
+          f"Flat days = {n_flat_days}")
+    print(f"  Round-trip trades: {n_round_trips}   "
+          f"Total position changes: {n_trades}")
+    print(f"  Win rate (active position-days): {win_pct:.1f}%")
 
-    # Figure 6
+    # Figure 6 — with time-varying thresholds (no look-ahead)
     fig, ax = plt.subplots(figsize=(14, 5))
-    ax.plot(td, dynamic_score, lw=0.8, label="Ensemble Dynamic Score")
-    ax.axhline(
-        up_th, color="red", ls="--",
-        label=f"Sell threshold ({UPPER_PCT}th pct)",
-    )
-    ax.axhline(
-        lo_th, color="green", ls="--",
-        label=f"Buy threshold ({LOWER_PCT}th pct)",
-    )
-    ax.axhline(0, color="k", ls=":", lw=0.5)
+    ax.plot(td, dynamic_score, lw=0.8, color="steelblue",
+            label="Ensemble Dynamic Score")
 
-    buy_m = sigs == 1
-    sell_m = sigs == -1
-    if buy_m.any():
+    # Expanding-window thresholds (time-varying)
+    valid_th = ~np.isnan(up_arr)
+    ax.plot(td[valid_th], up_arr[valid_th], color="red", ls="--", lw=0.7,
+            label=f"Sell threshold ({UPPER_PCT}th pct, expanding)")
+    ax.plot(td[valid_th], lo_arr[valid_th], color="green", ls="--", lw=0.7,
+            label=f"Buy threshold ({LOWER_PCT}th pct, expanding)")
+    ax.axhline(0, color="k", ls=":", lw=0.5, label="Mean (exit level)")
+
+    # Mark trade entries only (not all position-days)
+    prev_sig = np.concatenate([[0], sigs[:-1]])
+    long_entry = (sigs == 1) & (prev_sig != 1)
+    short_entry = (sigs == -1) & (prev_sig != -1)
+    if long_entry.any():
         ax.scatter(
-            td[buy_m], dynamic_score[buy_m],
-            c="green", marker="^", s=30, label="BUY", zorder=3,
+            td[long_entry], dynamic_score[long_entry],
+            c="green", marker="^", s=40, label="Enter LONG", zorder=3,
         )
-    if sell_m.any():
+    if short_entry.any():
         ax.scatter(
-            td[sell_m], dynamic_score[sell_m],
-            c="red", marker="v", s=30, label="SELL", zorder=3,
+            td[short_entry], dynamic_score[short_entry],
+            c="red", marker="v", s=40, label="Enter SHORT", zorder=3,
         )
     ax.set_title(
         "Dynamic Ensemble Forecast Score & Trading Signals  [Figure 6]"
     )
     ax.set_xlabel("Date")
     ax.set_ylabel("Dynamic Score")
-    ax.legend()
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig("figure6_signals.png", dpi=150)
@@ -960,7 +1059,7 @@ def main() -> None:  # noqa: C901
 
     # Table 5 (sample of dynamic scores and actions)
     labels = np.where(
-        sigs == 1, "BUY", np.where(sigs == -1, "SELL", "HOLD")
+        sigs == 1, "LONG", np.where(sigs == -1, "SHORT", "FLAT")
     )
     idx5 = np.linspace(0, len(dynamic_score) - 1, 10, dtype=int)
     t5 = pd.DataFrame({
@@ -985,7 +1084,8 @@ def main() -> None:  # noqa: C901
 
     rm = risk_metrics(
         sigs, y_actual,
-        eth_ret if len(eth_ret) == len(sigs) - 1 else None,
+        tc_cost=TC_COST,
+        market_ret=eth_ret if len(eth_ret) == len(sigs) - 1 else None,
     )
     for k, v in rm.items():
         if isinstance(v, float) and not np.isnan(v):
